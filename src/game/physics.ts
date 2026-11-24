@@ -1,5 +1,6 @@
 import { findClosestRoutePoint, sampleRouteAtS, type BuildingFootprint, type MerkatoWorldData } from '../data/merkatoRoutes';
-import type { AiVehicle } from './models/livingMarket';
+import { DISTRICT_BOUNDS, type RoadblockCollider } from './models/landmarks';
+import type { AiVehicle, PedestrianActor } from './models/livingMarket';
 
 export interface MinibusPhysicsState {
   x: number;
@@ -25,17 +26,28 @@ export interface DrivingInput {
 
 export interface CollisionEvent {
   severity: number; // 0..1
-  kind: 'building' | 'traffic' | 'parked';
+  kind: 'building' | 'traffic' | 'parked' | 'roadblock';
+}
+
+export interface PedestrianImpact {
+  ped: PedestrianActor;
+  vx: number;
+  vz: number;
+  impactSpeed: number;
+}
+
+export interface PhysicsStepResult {
+  collision: CollisionEvent | null;
+  pedImpacts: PedestrianImpact[];
 }
 
 // Toyota HiAce loaded minibus specs:
-// Wheelbase ~ 2.58m, max wheel angle ~ 36 deg -> ~4.4m turning radius (clears tight Merkato corners & U-turns!)
 const WHEELBASE = 2.58;
 const MAX_STEER_RAD = (36 * Math.PI) / 180;
 const MAX_FORWARD_MS = 12.8; // ~46 km/h top speed in dense market
 const MAX_REVERSE_MS = -4.2; // ~15 km/h reverse
-const ACCEL_RATE = 6.2; // Loaded van pull
-const BRAKE_DECEL = 11.5; // Firm loaded-van braking
+const ACCEL_RATE = 6.2;
+const BRAKE_DECEL = 11.5;
 const COAST_DRAG = 2.4;
 const VEHICLE_HALF_W = 0.88;
 const VEHICLE_HALF_L = 2.25;
@@ -64,7 +76,6 @@ function resolveCircleVsOrientedBox(
   pr: number,
   b: BuildingFootprint
 ): { hit: boolean; nx: number; nz: number; pen: number } {
-  // Fast broad-phase radius check
   const dx = px - b.cx;
   const dz = pz - b.cz;
   if (dx * dx + dz * dz > (b.radius + pr + 2) ** 2) {
@@ -75,7 +86,6 @@ function resolveCircleVsOrientedBox(
   const hd = Math.min(28, b.depth * 0.86) * 0.5;
   const cos = Math.cos(b.angle);
   const sin = Math.sin(b.angle);
-  // Rotate world offset into building local frame (note building rotated by -b.angle around Y)
   const lx = dx * cos - dz * sin;
   const lz = dx * sin + dz * cos;
 
@@ -97,7 +107,6 @@ function resolveCircleVsOrientedBox(
     lnz = oz / d;
     pen = pr - d;
   } else {
-    // Inside box -> push out shortest axis
     const pxOverlap = hw - Math.abs(lx);
     const pzOverlap = hd - Math.abs(lz);
     if (pxOverlap < pzOverlap) {
@@ -109,7 +118,6 @@ function resolveCircleVsOrientedBox(
     }
   }
 
-  // Rotate normal back to world XZ
   const wnx = lnx * cos + lnz * sin;
   const wnz = -lnx * sin + lnz * cos;
   return { hit: true, nx: wnx, nz: wnz, pen };
@@ -122,20 +130,19 @@ export function stepMinibusPhysics(
   world: MerkatoWorldData,
   aiVehicles: AiVehicle[],
   parkedColliders: { x: number; z: number; radius: number }[],
-  doorLockedOpen: boolean
-): CollisionEvent | null {
-  // Cannot drive away while passenger sliding door is open!
+  doorLockedOpen: boolean,
+  roadblockColliders: RoadblockCollider[] = [],
+  pedestrians: PedestrianActor[] = []
+): PhysicsStepResult {
   const effectiveThrottle = doorLockedOpen ? false : input.throttle;
   const effectiveBrake = doorLockedOpen ? true : input.brake;
 
-  // Steering input (+left, -right)
   const steerTarget = (input.left ? 1 : 0) - (input.right ? 1 : 0);
   const speedRatio = Math.min(1, Math.abs(state.speed) / MAX_FORWARD_MS);
   const dynamicMaxSteer = MAX_STEER_RAD * (1 - 0.32 * speedRatio);
   const steerRate = steerTarget === 0 ? 7.5 : 4.6;
   state.steerAngle += (steerTarget * dynamicMaxSteer - state.steerAngle) * Math.min(1, steerRate * dt);
 
-  // Acceleration, braking, then reverse (S/Down brakes to 0 first, then reverses smoothly)
   const prevSpeed = state.speed;
   state.isBraking = false;
   state.isReversing = false;
@@ -167,17 +174,14 @@ export function stepMinibusPhysics(
     }
   }
 
-  // Loaded-van pitch & roll suspension feel
   const accelMs2 = (state.speed - prevSpeed) / Math.max(0.005, dt);
   const targetPitch = Math.max(-0.04, Math.min(0.04, -accelMs2 * 0.0032));
   const targetRoll = Math.max(-0.045, Math.min(0.045, -state.steerAngle * state.speed * 0.0075));
   state.pitch += (targetPitch - state.pitch) * Math.min(1, 8 * dt);
   state.roll += (targetRoll - state.roll) * Math.min(1, 8 * dt);
 
-  // Bicycle kinematics
   if (Math.abs(state.speed) > 0.01) {
     const angularVel = (state.speed / WHEELBASE) * Math.tan(state.steerAngle);
-    // Note: heading = 0 is -Z, +PI/2 is +X; turning left (+steerAngle) decreases heading
     state.heading -= angularVel * dt;
     const fwdX = Math.sin(state.heading);
     const fwdZ = -Math.cos(state.heading);
@@ -188,11 +192,22 @@ export function stepMinibusPhysics(
     state.wheelSpinAccum = 0;
   }
 
-  // Clamp within outer Merkato perimeter
-  state.x = Math.max(-690, Math.min(580, state.x));
-  state.z = Math.max(-420, Math.min(420, state.z));
+  // Clamp within GTA-style Merkato district boundary box
+  let collision: CollisionEvent | null = null;
+  if (
+    state.x < DISTRICT_BOUNDS.minX - 4 ||
+    state.x > DISTRICT_BOUNDS.maxX + 4 ||
+    state.z < DISTRICT_BOUNDS.minZ - 4 ||
+    state.z > DISTRICT_BOUNDS.maxZ + 4
+  ) {
+    state.x = Math.max(DISTRICT_BOUNDS.minX - 4, Math.min(DISTRICT_BOUNDS.maxX + 4, state.x));
+    state.z = Math.max(DISTRICT_BOUNDS.minZ - 4, Math.min(DISTRICT_BOUNDS.maxZ + 4, state.z));
+    if (Math.abs(state.speed) > 1.2) {
+      collision = { severity: Math.min(1, Math.abs(state.speed) / 8), kind: 'roadblock' };
+      state.speed *= 0.25;
+    }
+  }
 
-  // Two-circle collision envelope for the 4.5m x 1.76m van (front sphere + rear sphere)
   const fwdX = Math.sin(state.heading);
   const fwdZ = -Math.cos(state.heading);
   const probes: [number, number][] = [
@@ -201,12 +216,9 @@ export function stepMinibusPhysics(
   ];
   const probeR = VEHICLE_HALF_W + 0.05;
 
-  let collision: CollisionEvent | null = null;
-
   // Check building footprints
   for (const b of world.buildings) {
     if (b.kind === 'mosque' || b.kind === 'church') {
-      // Use tighter hero facade core collision for mosque/church plazas
       const heroR = b.kind === 'mosque' ? 32 : 20;
       const dx = state.x - b.cx;
       const dz = state.z - b.cz;
@@ -232,6 +244,26 @@ export function stepMinibusPhysics(
           collision = { severity: sev, kind: 'building' };
         }
         state.speed *= 0.35;
+      }
+    }
+  }
+
+  // Check GTA-style perimeter roadblock Jersey barriers
+  for (const rb of roadblockColliders) {
+    for (const [px, pz] of probes) {
+      const dx = px - rb.x;
+      const dz = pz - rb.z;
+      const d = Math.hypot(dx, dz);
+      const minD = probeR + rb.radius;
+      if (d < minD && d > 0.001) {
+        const pen = minD - d;
+        state.x += (dx / d) * pen;
+        state.z += (dz / d) * pen;
+        const sev = Math.min(1, Math.abs(state.speed) / 7);
+        if (sev > 0.12 && (!collision || sev > collision.severity)) {
+          collision = { severity: sev, kind: 'roadblock' };
+        }
+        state.speed *= 0.2;
       }
     }
   }
@@ -278,12 +310,37 @@ export function stepMinibusPhysics(
     }
   }
 
-  // Update route progress S
+  // Check Pedestrian Collisions (crush / knock aside with momentum!)
+  const pedImpacts: PedestrianImpact[] = [];
+  const absSpd = Math.abs(state.speed);
+  if (absSpd > 0.9 && pedestrians.length > 0) {
+    for (const ped of pedestrians) {
+      if (!ped.group.visible || ped.hitCooldown > 0 || ped.knockedTimer > 0.5) continue;
+      for (const [px, pz] of probes) {
+        const dx = ped.x - px;
+        const dz = ped.z - pz;
+        const d = Math.hypot(dx, dz);
+        const minD = probeR + 0.34;
+        if (d < minD && d > 0.001) {
+          const pushDirX = dx / d;
+          const pushDirZ = dz / d;
+          const driveDir = state.speed >= 0 ? 1 : -1;
+          const launchSpeed = Math.max(2.6, absSpd * 0.95);
+          const vx = (fwdX * driveDir * 0.65 + pushDirX * 0.55) * launchSpeed;
+          const vz = (fwdZ * driveDir * 0.65 + pushDirZ * 0.55) * launchSpeed;
+          pedImpacts.push({ ped, vx, vz, impactSpeed: absSpd });
+          state.speed *= 0.88;
+          break;
+        }
+      }
+    }
+  }
+
   const closest = findClosestRoutePoint(world.route, state.x, state.z, state.routeS);
   state.routeS = closest.s;
   state.offRouteDist = closest.dist;
 
-  return collision;
+  return { collision, pedImpacts };
 }
 
 export function recoverToNearestRoute(state: MinibusPhysicsState, world: MerkatoWorldData): void {

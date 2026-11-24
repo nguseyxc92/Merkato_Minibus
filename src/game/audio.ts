@@ -218,6 +218,39 @@ export class MerkatoAudioEngine {
     osc.stop(now + 0.2);
   }
 
+  public playPedestrianHit(): void {
+    if (!this.ctx || !this.masterGain || this.muted) return;
+    const now = this.ctx.currentTime;
+    // Thud + vocalized startled pitch drop
+    const thud = this.ctx.createOscillator();
+    thud.type = 'triangle';
+    thud.frequency.setValueAtTime(140, now);
+    thud.frequency.exponentialRampToValueAtTime(42, now + 0.2);
+    const tg = this.ctx.createGain();
+    tg.gain.setValueAtTime(0.35, now);
+    tg.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
+    thud.connect(tg);
+    tg.connect(this.masterGain);
+    thud.start(now);
+    thud.stop(now + 0.24);
+
+    const yell = this.ctx.createOscillator();
+    yell.type = 'sawtooth';
+    yell.frequency.setValueAtTime(360, now + 0.03);
+    yell.frequency.exponentialRampToValueAtTime(195, now + 0.28);
+    const yf = this.ctx.createBiquadFilter();
+    yf.type = 'bandpass';
+    yf.frequency.value = 820;
+    const yg = this.ctx.createGain();
+    yg.gain.setValueAtTime(0.14, now + 0.03);
+    yg.gain.exponentialRampToValueAtTime(0.001, now + 0.3);
+    yell.connect(yf);
+    yf.connect(yg);
+    yg.connect(this.masterGain);
+    yell.start(now + 0.03);
+    yell.stop(now + 0.32);
+  }
+
   public dispose(): void {
     try {
       this.engineOsc1?.stop();

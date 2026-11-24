@@ -391,24 +391,49 @@ export class MerkatoEngine {
         this.hitstopTimer = Math.max(0, this.hitstopTimer - dt);
       } else {
         const input = this.getDrivingInput();
-        const col = stepMinibusPhysics(
+        const stepRes = stepMinibusPhysics(
           this.physics,
           input,
           dt,
           this.world,
           this.market.aiVehicles,
           this.market.parkedColliders,
-          this.mission.doorOpen || this.mission.doorOpenRatio > 0.15
+          this.mission.doorOpen || this.mission.doorOpenRatio > 0.15,
+          this.worldAssets.roadblockColliders,
+          this.market.pedestrians
         );
+        const col = stepRes.collision;
         if (col) {
           this.audio.playBump(col.severity);
           this.mission.recordCollision(col.severity);
           this.hitstopTimer = 0.04;
           this.shakeStrength = Math.min(0.42, 0.12 + col.severity * 0.3);
           this.showNotice(
-            col.kind === 'traffic' ? 'Careful! Bumped market traffic.' : 'Watch the tight Merkato curb!',
-            2.0
+            col.kind === 'roadblock'
+              ? 'District boundary roadblock — stay inside Merkato!'
+              : col.kind === 'traffic'
+                ? 'Careful! Bumped market traffic.'
+                : 'Watch the tight Merkato curb!',
+            2.2
           );
+        }
+
+        if (stepRes.pedImpacts.length > 0) {
+          for (const imp of stepRes.pedImpacts) {
+            this.market.knockPedestrian(imp.ped, imp.vx, imp.vz, imp.impactSpeed);
+            this.mission.recordPedestrianHit();
+          }
+          this.audio.playPedestrianHit();
+          this.mission.pushCustomSubtitle(
+            'ኧረ ተጠንቀቅ!',
+            'Ere tetenkek!',
+            'Hey, watch where you are driving!',
+            'Pedestrian',
+            this.mission.elapsedSec
+          );
+          this.hitstopTimer = 0.045;
+          this.shakeStrength = Math.max(this.shakeStrength, 0.28);
+          this.showNotice('Watch out for pedestrians! (-15% Safety)', 2.4);
         }
 
         let missionCompletedNow = false;
@@ -442,6 +467,12 @@ export class MerkatoEngine {
           this.physics.isBraking || this.mission.doorOpen
         );
         this.audio.updateEngine(this.physics.speed * 3.6, input.throttle ? 1 : 0, true);
+
+        // Pulse GTA roadblock amber beacons
+        const beaconOn = Math.sin(this.elapsed * 6.5) > 0;
+        for (const bMesh of this.worldAssets.roadblockBeacons) {
+          bMesh.visible = beaconOn;
+        }
 
         // Update stop bay highlights & waiting passenger clusters
         const activeStop = this.mission.getCurrentStop();

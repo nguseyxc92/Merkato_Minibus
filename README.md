@@ -51,6 +51,7 @@ All street centerlines, junctions, one-way carriageways, building footprints, pe
   6. **Gojam Berenda (`ጎጃም በረንዳ`)** — Fitawrari Habte Giorgis St (Westbound `oneway=yes`, OSM node `10845731585`)
   7. **Autobis Tera Terminal** — Loop return via `25683064` (`oneway=yes`) & Kenya Street
 - **Pedestrian-Only Ways:** Mapped `footway` / `pedestrian` ways are rendered as cobble market alleys populated with pedestrians and excluded from taxi routing.
+- **3D Streetscape & District Roadblocks:** Drivable streets include raised 3D concrete curbs, crosswalks, streetlights with overhead wires, multi-part 3D shopfronts (stocked interior bays, pilasters, awning struts, crates/sacks, upper floor ledges, and rooftop Roto water tanks), and `"መንገድ ተዘግቷል / ROAD CLOSED"` barricades at district perimeter exits.
 
 ---
 

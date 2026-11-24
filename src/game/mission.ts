@@ -202,8 +202,22 @@ export class MissionDirector {
     };
   }
 
+  public pushCustomSubtitle(amharic: string, translit: string, english: string, speaker: string, nowSec: number): void {
+    this.subtitle = {
+      amharic,
+      translit,
+      english,
+      speaker,
+      expiresAt: nowSec + 3.2,
+    };
+  }
+
   public recordCollision(severity: number): void {
     this.safetyScore = Math.max(20, this.safetyScore - Math.round(4 + severity * 10));
+  }
+
+  public recordPedestrianHit(): void {
+    this.safetyScore = Math.max(0, this.safetyScore - 15);
   }
 
   public update(

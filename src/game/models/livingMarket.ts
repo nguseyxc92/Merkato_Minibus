@@ -30,6 +30,12 @@ export interface PedestrianActor {
   speed: number;
   isCrossing: boolean;
   scaredTimer: number;
+  knockedTimer: number;
+  hitCooldown: number;
+  vx: number;
+  vz: number;
+  fallRot: number;
+  spinAngle: number;
   legL: THREE.Mesh;
   legR: THREE.Mesh;
 }
@@ -50,6 +56,7 @@ export interface LivingMarketSystem {
   stopClusters: Map<string, StopPassengerCluster>;
   setDensity: (density: TrafficDensity) => void;
   triggerHornReaction: (px: number, pz: number) => void;
+  knockPedestrian: (ped: PedestrianActor, impulseX: number, impulseZ: number, speedMs: number) => void;
   update: (
     dt: number,
     playerX: number,
@@ -104,7 +111,6 @@ function createCompactVehicle(
     cabin.castShadow = true;
     g.add(cabin);
   } else {
-    // Isuzu NPR market delivery truck
     const cab = new THREE.Mesh(new THREE.BoxGeometry(1.85, 1.35, 1.45), upperMat);
     cab.position.set(0, 1.12, -1.45);
     cab.castShadow = true;
@@ -160,7 +166,6 @@ function createPersonMesh(
   g.add(torso);
 
   if (shawlColor !== null) {
-    // Traditional Ethiopian white netela shawl drape
     const shawlMat = new THREE.MeshStandardMaterial({ color: shawlColor, roughness: 0.88 });
     const shawl = new THREE.Mesh(new THREE.BoxGeometry(0.41, 0.36, 0.25), shawlMat);
     shawl.position.y = 1.06;
@@ -172,7 +177,6 @@ function createPersonMesh(
   g.add(head);
 
   if (carryGoods) {
-    // Basket / crate carried on head or shoulder (authentic Merkato porter!)
     const crateMat = new THREE.MeshStandardMaterial({ color: 0xc28e48, roughness: 0.82 });
     const basket = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.16, 0.24, 10), crateMat);
     basket.position.y = 1.62;
@@ -208,18 +212,28 @@ function createHandcart(): THREE.Group {
     wheel.position.set(wx, 0.36, 0);
     g.add(wheel);
   }
-  // Stacked sacks on cart
   const sack1 = new THREE.Mesh(new THREE.BoxGeometry(0.85, 0.38, 1.1), sackMat);
   sack1.position.set(0, 0.78, -0.1);
   g.add(sack1);
   return g;
 }
 
+interface DustPuff {
+  x: number;
+  y: number;
+  z: number;
+  vx: number;
+  vy: number;
+  vz: number;
+  life: number;
+  maxLife: number;
+}
+
 export function createLivingMarket(world: MerkatoWorldData, textures: TextureBundle): LivingMarketSystem {
   const group = new THREE.Group();
   const skinMat = new THREE.MeshStandardMaterial({ color: 0x6b422e, roughness: 0.8 });
 
-  // 1. Moving AI Traffic along the mapped route (different starting s values)
+  // 1. Moving AI Traffic along the mapped route
   const aiVehicles: AiVehicle[] = [];
   const vehicleSpecs: { s: number; kind: 'minibus' | 'lada' | 'isuzu'; speed: number; offset: number }[] = [
     { s: 130, kind: 'minibus', speed: 7.4, offset: 0.5 },
@@ -258,14 +272,13 @@ export function createLivingMarket(world: MerkatoWorldData, textures: TextureBun
     });
   });
 
-  // 2. Parked Minibuses & Handcarts along wide market shoulders (leaving route clear!)
+  // 2. Parked Minibuses, Handcarts & Market Umbrellas along wide market shoulders (strictly outside main lane!)
   const parkedColliders: { x: number; z: number; radius: number }[] = [];
   const parkedSList = [65, 390, 820, 1280, 1620, 2220];
   parkedSList.forEach((ps, idx) => {
     const pt = sampleRouteAtS(world.route, ps);
     const rightX = Math.cos(pt.heading);
     const rightZ = Math.sin(pt.heading);
-    // Offset far right onto shoulder (4.2m from centerline -> leaves > 6m clear lane!)
     const px = pt.x + rightX * 4.4;
     const pz = pt.z + rightZ * 4.4;
     if (idx % 2 === 0) {
@@ -283,22 +296,50 @@ export function createLivingMarket(world: MerkatoWorldData, textures: TextureBun
     }
   });
 
+  // Market umbrellas on outer sidewalk shoulders (safe offset 5.7m left/right of route)
+  const umbrellaColors = [0xe11d48, 0x0284c7, 0xd97706, 0x16a34a];
+  const poleMat = new THREE.MeshStandardMaterial({ color: 0x475569, roughness: 0.6 });
+  const umbPoleGeo = new THREE.CylinderGeometry(0.04, 0.04, 2.4, 6);
+  const umbTopGeo = new THREE.ConeGeometry(1.35, 0.55, 8);
+  for (let s = 95; s < world.totalRouteLength - 80; s += 190) {
+    const pt = sampleRouteAtS(world.route, s);
+    const rightX = Math.cos(pt.heading);
+    const rightZ = Math.sin(pt.heading);
+    const side = (Math.round(s) % 380 < 190 ? -1 : 1) * 5.85;
+    const ux = pt.x + rightX * side;
+    const uz = pt.z + rightZ * side;
+
+    const uGroup = new THREE.Group();
+    uGroup.position.set(ux, 0, uz);
+    const pole = new THREE.Mesh(umbPoleGeo, poleMat);
+    pole.position.y = 1.2;
+    uGroup.add(pole);
+    const canopyMat = new THREE.MeshStandardMaterial({
+      color: umbrellaColors[Math.round(s) % umbrellaColors.length],
+      roughness: 0.72,
+    });
+    const canopy = new THREE.Mesh(umbTopGeo, canopyMat);
+    canopy.position.y = 2.45;
+    canopy.castShadow = true;
+    uGroup.add(canopy);
+    group.add(uGroup);
+  }
+
   // 3. Pedestrians & Shoppers (sidewalks + pedestrian-only lanes + crossing spots)
   const pedestrians: PedestrianActor[] = [];
   const palette = [0x1d4ed8, 0xb91c1c, 0x047857, 0xd97706, 0x6d28d9, 0x374151, 0xbe185d];
 
-  // Sidewalk & crossing pedestrians along route
-  for (let s = 45; s < world.totalRouteLength - 40; s += 52) {
+  for (let s = 45; s < world.totalRouteLength - 40; s += 46) {
     const pt = sampleRouteAtS(world.route, s);
     const rightX = Math.cos(pt.heading);
     const rightZ = Math.sin(pt.heading);
     const fwdX = Math.sin(pt.heading);
     const fwdZ = -Math.cos(pt.heading);
 
-    const isCrossing = Math.round(s) % 156 === 45;
-    const side = isCrossing ? 0 : s % 104 < 52 ? 1 : -1;
-    const baseX = pt.x + rightX * (isCrossing ? 0 : side * 4.9);
-    const baseZ = pt.z + rightZ * (isCrossing ? 0 : side * 4.9);
+    const isCrossing = Math.round(s) % 138 === 45;
+    const side = isCrossing ? 0 : s % 92 < 46 ? 1 : -1;
+    const baseX = pt.x + rightX * (isCrossing ? 0 : side * 4.4);
+    const baseZ = pt.z + rightZ * (isCrossing ? 0 : side * 4.4);
 
     const { group: pg, legL, legR } = createPersonMesh(
       palette[pedestrians.length % palette.length],
@@ -322,12 +363,17 @@ export function createLivingMarket(world: MerkatoWorldData, textures: TextureBun
       speed: isCrossing ? 1.15 : 1.0 + (pedestrians.length % 3) * 0.25,
       isCrossing,
       scaredTimer: 0,
+      knockedTimer: 0,
+      hitCooldown: 0,
+      vx: 0,
+      vz: 0,
+      fallRot: 0,
+      spinAngle: 0,
       legL,
       legR,
     });
   }
 
-  // Pedestrians inside OSM pedestrian-only ways (no vehicles allowed!)
   for (const pedRoad of world.pedestrianRoads) {
     for (let i = 0; i < pedRoad.pts.length - 1; i++) {
       const [ax, az] = pedRoad.pts[i];
@@ -356,6 +402,12 @@ export function createLivingMarket(world: MerkatoWorldData, textures: TextureBun
         speed: 1.1,
         isCrossing: false,
         scaredTimer: 0,
+        knockedTimer: 0,
+        hitCooldown: 0,
+        vx: 0,
+        vz: 0,
+        fallRot: 0,
+        spinAngle: 0,
         legL,
         legR,
       });
@@ -369,9 +421,6 @@ export function createLivingMarket(world: MerkatoWorldData, textures: TextureBun
     const clusterGroup = new THREE.Group();
     const rightX = Math.cos(stop.heading);
     const rightZ = Math.sin(stop.heading);
-    const fwdX = Math.sin(stop.heading);
-    const fwdZ = -Math.cos(stop.heading);
-    // Sidewalk waiting area 2.3m right of curb bay
     const waitX = stop.curbX + rightX * 2.1;
     const waitZ = stop.curbZ + rightZ * 2.1;
     clusterGroup.position.set(waitX, 0, waitZ);
@@ -388,15 +437,12 @@ export function createLivingMarket(world: MerkatoWorldData, textures: TextureBun
       const localZ = (i - 1.5) * 1.1;
       const localX = (i % 2) * 0.45;
       pg.position.set(localX, 0, localZ);
-      pg.rotation.y = -Math.PI / 2; // facing road curb
+      pg.rotation.y = -Math.PI / 2;
       pg.userData.homeX = localX;
       pg.userData.homeZ = localZ;
       clusterGroup.add(pg);
       peds.push(pg);
     }
-    // Keep unused fwd variables clean
-    void fwdX;
-    void fwdZ;
     group.add(clusterGroup);
 
     stopClusters.set(stop.id, {
@@ -419,6 +465,49 @@ export function createLivingMarket(world: MerkatoWorldData, textures: TextureBun
       },
     });
   }
+
+  // 5. Pooled Impact Dust Puff Particles (InstancedMesh, zero GC)
+  const MAX_PUFFS = 36;
+  const puffGeo = new THREE.SphereGeometry(0.32, 6, 6);
+  const puffMat = new THREE.MeshBasicMaterial({
+    color: 0xd6c2a3,
+    transparent: true,
+    opacity: 0.65,
+    depthWrite: false,
+  });
+  const puffInst = new THREE.InstancedMesh(puffGeo, puffMat, MAX_PUFFS);
+  puffInst.frustumCulled = false;
+  group.add(puffInst);
+
+  const puffs: DustPuff[] = Array.from({ length: MAX_PUFFS }, () => ({
+    x: 0,
+    y: -10,
+    z: 0,
+    vx: 0,
+    vy: 0,
+    vz: 0,
+    life: 0,
+    maxLife: 0.5,
+  }));
+  let puffCursor = 0;
+  const puffDummy = new THREE.Object3D();
+
+  const spawnDustBurst = (x: number, z: number) => {
+    for (let i = 0; i < 10; i++) {
+      const p = puffs[puffCursor];
+      puffCursor = (puffCursor + 1) % MAX_PUFFS;
+      const ang = (i / 10) * Math.PI * 2 + Math.random() * 0.4;
+      const spd = 1.8 + Math.random() * 2.5;
+      p.x = x;
+      p.y = 0.55;
+      p.z = z;
+      p.vx = Math.cos(ang) * spd;
+      p.vy = 1.2 + Math.random() * 1.4;
+      p.vz = Math.sin(ang) * spd;
+      p.maxLife = 0.48 + Math.random() * 0.2;
+      p.life = p.maxLife;
+    }
+  };
 
   let currentDensity: TrafficDensity = 'normal';
 
@@ -451,6 +540,14 @@ export function createLivingMarket(world: MerkatoWorldData, textures: TextureBun
         }
       }
     },
+    knockPedestrian: (ped, impulseX, impulseZ, speedMs) => {
+      ped.vx = impulseX;
+      ped.vz = impulseZ;
+      ped.knockedTimer = speedMs >= 2.2 ? 3.4 : 1.1;
+      ped.hitCooldown = 1.5;
+      ped.spinAngle = Math.atan2(impulseX, impulseZ);
+      spawnDustBurst(ped.x, ped.z);
+    },
     update: (dt, playerX, playerZ, playerSpeedMs, elapsed) => {
       // Update AI traffic along route
       for (let i = 0; i < aiVehicles.length; i++) {
@@ -458,7 +555,6 @@ export function createLivingMarket(world: MerkatoWorldData, textures: TextureBun
         if (!v.active) continue;
 
         let targetSpeed = v.baseSpeed;
-        // Check distance to player ahead
         const dxP = playerX - v.x;
         const dzP = playerZ - v.z;
         const distP = Math.hypot(dxP, dzP);
@@ -469,7 +565,6 @@ export function createLivingMarket(world: MerkatoWorldData, textures: TextureBun
           targetSpeed = Math.min(targetSpeed, Math.max(0, (distP - 6.8) * 1.2));
         }
 
-        // Check distance to other AI vehicles ahead
         for (let j = 0; j < aiVehicles.length; j++) {
           if (i === j || !aiVehicles[j].active) continue;
           const o = aiVehicles[j];
@@ -481,9 +576,8 @@ export function createLivingMarket(world: MerkatoWorldData, textures: TextureBun
           }
         }
 
-        // Check crossing pedestrians
         for (const p of pedestrians) {
-          if (!p.isCrossing || !p.group.visible) continue;
+          if (!p.isCrossing || !p.group.visible || p.knockedTimer > 0) continue;
           const distPed = Math.hypot(p.x - v.x, p.z - v.z);
           if (distPed < 10 && (p.x - v.x) * fwdX + (p.z - v.z) * fwdZ > 0) {
             targetSpeed = 0;
@@ -508,15 +602,48 @@ export function createLivingMarket(world: MerkatoWorldData, textures: TextureBun
         v.group.rotation.y = -v.heading;
       }
 
-      // Update pedestrians
+      // Update pedestrians (walking + physical knockdown / crush tumble recovery)
       for (const p of pedestrians) {
         if (!p.group.visible) continue;
+        if (p.hitCooldown > 0) p.hitCooldown = Math.max(0, p.hitCooldown - dt);
         if (p.scaredTimer > 0) p.scaredTimer = Math.max(0, p.scaredTimer - dt);
 
+        if (p.knockedTimer > 0) {
+          p.knockedTimer = Math.max(0, p.knockedTimer - dt);
+          p.x += p.vx * dt;
+          p.z += p.vz * dt;
+          const damp = Math.exp(-4.8 * dt);
+          p.vx *= damp;
+          p.vz *= damp;
+
+          let hopY = 0;
+          if (p.knockedTimer > 0.7) {
+            // Knocked flat onto ground (first 0.4s hops slightly)
+            const elapsedKnock = 3.4 - p.knockedTimer;
+            if (elapsedKnock < 0.45) {
+              hopY = Math.sin((elapsedKnock / 0.45) * Math.PI) * 0.42;
+            }
+            p.fallRot = Math.min(Math.PI * 0.48, p.fallRot + dt * 9.5);
+          } else {
+            // Getting back up
+            p.fallRot = Math.max(0, p.fallRot - dt * 2.5);
+            // Smoothly return base anchor near settled position or sidewalk
+            p.x += (p.baseX - p.x) * Math.min(1, dt * 1.4);
+            p.z += (p.baseZ - p.z) * Math.min(1, dt * 1.4);
+          }
+
+          p.group.position.set(p.x, hopY + (p.fallRot / (Math.PI * 0.48)) * 0.16, p.z);
+          p.group.rotation.set(p.fallRot, p.spinAngle, 0);
+          p.legL.rotation.x = p.fallRot * 0.25;
+          p.legR.rotation.x = -p.fallRot * 0.25;
+          continue;
+        }
+
+        // Upright walking behavior
+        p.fallRot = 0;
         const distPlayer = Math.hypot(p.x - playerX, p.z - playerZ);
         let speedScale = 1;
         if (p.isCrossing) {
-          // Pause crossing if player taxi is right nearby and moving
           if (distPlayer < 9 && Math.abs(playerSpeedMs) > 1.2 && p.scaredTimer <= 0) {
             speedScale = 0.05;
           } else if (p.scaredTimer > 0) {
@@ -530,17 +657,43 @@ export function createLivingMarket(world: MerkatoWorldData, textures: TextureBun
         p.x = p.baseX + p.dirX * offset;
         p.z = p.baseZ + p.dirZ * offset;
         p.group.position.set(p.x, 0, p.z);
-        p.group.rotation.y = Math.atan2(p.dirX * cosDir, p.dirZ * cosDir);
+        p.group.rotation.set(0, Math.atan2(p.dirX * cosDir, p.dirZ * cosDir), 0);
 
         const swing = speedScale > 0.1 ? Math.sin(elapsed * 7.5 + p.phase) * 0.42 : 0;
         p.legL.rotation.x = swing;
         p.legR.rotation.x = -swing;
       }
 
+      // Update dust puffs
+      for (let i = 0; i < MAX_PUFFS; i++) {
+        const pf = puffs[i];
+        if (pf.life > 0) {
+          pf.life = Math.max(0, pf.life - dt);
+          pf.x += pf.vx * dt;
+          pf.y += pf.vy * dt;
+          pf.z += pf.vz * dt;
+          pf.vy -= 2.2 * dt;
+          const t = pf.life / pf.maxLife;
+          const scale = (1 - t) * 1.4 + 0.4;
+          puffDummy.position.set(pf.x, Math.max(0.15, pf.y), pf.z);
+          puffDummy.scale.setScalar(scale * t);
+        } else {
+          puffDummy.position.set(0, -20, 0);
+          puffDummy.scale.setScalar(0.001);
+        }
+        puffDummy.updateMatrix();
+        puffInst.setMatrixAt(i, puffDummy.matrix);
+      }
+      puffInst.instanceMatrix.needsUpdate = true;
+
       void currentDensity;
     },
     dispose: () => {
-      // Scene resources cleaned up with world renderer disposal
+      puffGeo.dispose();
+      puffMat.dispose();
+      poleMat.dispose();
+      umbPoleGeo.dispose();
+      umbTopGeo.dispose();
     },
   };
 }
