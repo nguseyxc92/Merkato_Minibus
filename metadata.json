@@ -1,0 +1,6 @@
+{
+  "name": "Merkato Minibus",
+  "description": "Drive a blue-and-white Ethiopian share taxi through a mapped route in Addis Ababa's Merkato.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
